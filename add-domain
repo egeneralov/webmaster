@@ -1,0 +1,156 @@
+#!/bin/bash
+
+echo 'Don`t mistake'
+echo 'User must exist'
+echo ''
+read -p "User name: " user
+read -p "Domain: " domain
+echo ''
+
+# simple nginx config for domain
+echo "Writing $domain nginx config"
+cat <<< "
+server {
+	server_name $domain www.$domain;
+	root /sites/$user/$domain/;
+	index index.php;
+	allow all;
+	autoindex on;
+	location /.well-known/acme-challenge {
+		allow all;
+		autoindex on;
+	}
+}" > /etc/nginx/sites-available/$domain
+
+# connect site
+ln -s /etc/nginx/sites-available/$domain /etc/nginx/sites-enabled/$domain
+
+# create site directory
+mkdir /sites/$user/$domain
+chown $user:www-data /sites/$user/$domain
+chmod 770 /sites/$user/$domain
+
+# reload nginx config
+nginx -t
+service nginx reload
+
+# acme.sh verify domain
+echo "Domain verification"
+/root/.acme.sh/acme.sh --issue -d $domain -d www.$domain -w /sites/$user/$domain/ --home "/root/.acme.sh"
+
+#nginx permanent config for domain
+echo "Writing full nginx configuration"
+cat <<< '
+server {
+	server_name example.com www.example.com;
+	listen 80;
+	rewrite ^ https://$http_host$request_uri? permanent;
+}
+server {
+	server_name example.com www.example.com;
+#	listen 80;
+        	listen 443 ssl;
+    	ssl_certificate /etc/nginx/ssl/example.com.crt;
+    	ssl_certificate_key /etc/nginx/ssl/example.com.key;
+    	ssl_trusted_certificate /etc/nginx/ssl/example.com.ca;
+    root /sites/username/example.com;
+    index index.php;
+    allow all;
+    charset utf-8;
+    error_log   /var/log/nginx/example.com_error.log;
+    fastcgi_buffers 8 16k;
+    fastcgi_buffer_size 32k;
+    gzip on;
+    gzip_disable "msie6";
+    gzip_comp_level 6;
+    gzip_min_length 1100;
+    gzip_buffers 16 8k;
+    gzip_proxied any;
+    gzip_types text/plain application/xml
+    application/javascript
+    text/css
+    text/js
+    text/xml
+    application/x-javascript
+    text/javascript
+    application/json
+    application/xml+rss;
+    client_max_body_size 512m;
+    client_body_buffer_size 128k;
+    client_header_timeout   3m;
+    client_body_timeout 3m;
+    send_timeout 3m;
+    client_header_buffer_size   1k;
+    large_client_header_buffers 4 16k;
+    
+    location / {
+    	root /sites/username/example.com;
+    	index  index.php index.html;
+    	rewrite ^/api/(.*)$ /api.php?_d=$1&ajax_custom=1&$args last;
+    	try_files $uri $uri/ @fallback;
+    }
+    
+    location @fallback {
+    	rewrite  ^(.*)$ /index.php?$args last;
+    }
+    
+    location ~* \.(jpeg|ico|jpg|gif|png|css|js|pdf|txt|tar|gz|wof|csv|zip|xml|yml) {
+    	access_log off;
+    	try_files $uri @statics;
+    	expires 14d;
+    	add_header Access-Control-Allow-Origin *;
+    	add_header Cache-Control public;
+    	root /sites/username/example.com;
+    }
+    
+    location @statics {
+    	rewrite ^/(\w+)/(.*)$ /$2 break;
+    	access_log off;
+    	rewrite_log off;
+    	expires 14d;
+    	add_header Cache-Control public;
+    	add_header Access-Control-Allow-Origin *;
+    	root /sites/username/example.com;
+    }
+    
+    location ~ \.php$ {
+    	root /sites/username/example.com;
+    	proxy_read_timeout 61;
+    	fastcgi_read_timeout 61;
+    	try_files $uri $uri/ =404;
+    	fastcgi_pass unix:/var/run/php/php7.0-fpm.sock;
+    	fastcgi_index index.php;
+    	fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    	include fastcgi_params;
+    }
+    
+    location /.well-known/acme-challenge {
+    	allow all;
+    	autoindex on;
+    }
+    
+    location ~ /\.ht {
+    	deny  all;
+    }
+
+
+}
+
+' > /etc/nginx/sites-available/$domain
+
+sed -i "s/example.com/$domain/g" /etc/nginx/sites-available/$domain 
+sed -i "s/username/$user/g" /etc/nginx/sites-available/$domain 
+
+#install certificate 
+echo "Installing certificate"
+/root/.acme.sh/acme.sh --install-cert --home "/root/.acme.sh" -d $domain \
+--cert-file      /etc/nginx/ssl/$domain.crt  \
+--key-file       /etc/nginx/ssl/$domain.key  \
+--fullchain-file /etc/nginx/ssl/$domain.ca \
+--reloadcmd     "service nginx reload"
+
+echo "<?php echo phpinfo();" > /sites/$user/$domain/index.php
+chown -R $user:www-data /sites/$user
+
+
+nginx -t || rm /etc/nginx/sites-available/$domain; rm /etc/nginx/sites-enabled/$domain;

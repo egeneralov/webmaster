@@ -1,0 +1,17 @@
+#!/bin/bash
+
+read -p "User name: " user
+read -p "user pass: " userpasswd
+
+if [ -z "$user" ]
+then
+	echo "Enter user name"
+else
+	if [ -z "$userpasswd" ]
+	then
+		echo "Enter user password"
+	else
+		echo -e "$userpasswd\n$userpasswd\n$userfullname\n\n\n\n\n\n" | adduser $user --home /sites/$user --shell /bin/bash --ingroup www-data -q > /dev/null
+	fi
+fi
+

@@ -1,0 +1,400 @@
+#!/bin/bash
+
+#ask some questions
+domain=$1; read -p "Enter your domain [$domain]: " domain
+mysqlpasswd=$2; read -p "MySQL password [$mysqlpasswd]: " mysqlpasswd
+user=$3; read -p "Your user name [$user]: " user
+userfullname=$4; read -p "Your full name [$userfullname]: " userfullname
+userpasswd=$5; read -p "Your password: [$userpasswd] " userpasswd
+usermail=$6; read -p "Your current mail: [$usermail] " usermail
+
+echo $domain > /etc/mailname
+echo $domain > /etc/hostname
+sed -i 's/`uname -n`/$domain/g' /etc/hosts
+
+
+# fuck dpkg
+export DEBIAN_FRONTEND="noninteractive"
+
+#let`s go
+startTime=`date +%d-%m-%Y:%H:%M:%S`
+echo ''>> /root/log.txt;
+echo "installation started at $startTime" >> /root/log.txt
+startTime=`date +%s`
+
+# Clearing your system
+echo "Clearing your system and apt"
+apt-get autoremove -y --force-yes >> /root/log.txt 2>&1
+apt-get autoclean -y --force-yes >> /root/log.txt 2>&1
+apt-get clean >> /root/log.txt 2>&1
+
+# Update apt cache
+echo "Updating package cache"
+echo ''>> /root/log.txt; echo 'apt-get update'>> /root/log.txt
+apt-get update  >> /root/log.txt 2>&1 || echo "update failed, check networking and apt config";
+
+# Upgrade system
+echo "Upgrading system"
+echo ''>> /root/log.txt; echo 'apt-get upgrade'>> /root/log.txt 
+apt-get upgrade -y --force-yes >> /root/log.txt 2>&1 || echo "upgrade failed";
+
+
+# add repository dotdeb - need for php7 and lastest nginx
+echo "Adding dotdeb repository"
+apt-get install curl -y --force-yes >> /root/log.txt 2>&1 || echo "failed install openssl curl"
+echo "deb http://packages.dotdeb.org jessie all" >> /etc/apt/sources.list
+curl https://www.dotdeb.org/dotdeb.gpg -s | apt-key add - >> /root/log.txt 2>&1 
+apt-get update -y --force-yes >> /root/log.txt 2>&1 || echo "update failed";
+
+# generate ssl certs
+echo "Generating ssl certificate for mail"
+apt-get install openssl curl -y --force-yes >> /root/log.txt 2>&1 || echo "failed install openssl"
+openssl req -x509 -nodes -days 1 -newkey rsa:2048 -keyout /etc/ssl/private/mail.key -out /etc/ssl/certs/mailcert.pem -subj "/C=RU/ST=test/L=test/O=test/CN=$domain" >> /root/log.txt 2>&1
+
+#postfix installation
+echo "Installing postfix"
+echo $domain > /etc/mailname
+debconf-set-selections <<< "postfix postfix/mailname string $domain"
+debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
+apt-get remove --purge -y --force-yes exim4\* >> /root/log.txt 2>&1 || echo "remove exim failed";
+apt-get install -y postfix >> /root/log.txt 2>&1 || echo "postfix installation failed"; 
+postfix stop >> /root/log.txt 2>&1 || echo "posfix stop failed";
+
+#Postfix configuration
+echo $domain > /etc/mailname
+echo "Postfix configuration"
+cp /etc/postfix/master.cf /etc/postfix/master.cf.orig 
+cat <<< '
+submission inet n       -       -       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_wrappermode=no
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_recipient_restrictions=permit_mynetworks,permit_sasl_authenticated,reject
+  -o milter_macro_daemon_name=ORIGINATING
+  -o smtpd_sasl_type=dovecot
+  -o smtpd_sasl_path=private/auth
+' >> /etc/postfix/master.cf
+
+cp /etc/postfix/main.cf /etc/postfix/main.cf.orig
+cat <<< "
+myhostname = $domain
+myorigin = /etc/mailname
+mydestination = mail.$domain, $domain, localhost, localhost.localdomain
+relayhost =
+mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128
+mailbox_size_limit = 0
+recipient_delimiter = +
+inet_interfaces = all
+smtpd_tls_cert_file=/etc/ssl/certs/mailcert.pem
+smtpd_tls_key_file=/etc/ssl/private/mail.key
+smtpd_use_tls=yes
+smtpd_tls_session_cache_database = btree:${data_directory}/smtpd_scache
+smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
+smtpd_tls_security_level=may
+smtpd_tls_protocols = !SSLv2, !SSLv3
+local_recipient_maps = proxy:unix:passwd.byname $alias_maps
+" > /etc/postfix/main.cf
+
+# Dovecot install
+echo "Installing dovecot"
+apt-get install dovecot-core dovecot-imapd -y --force-yes >> /root/log.txt 2>&1 || echo "dovecot installation failed";
+
+# Dovecot config
+echo "Configuring dovecot"
+cat <<< '
+disable_plaintext_auth = no
+mail_privileged_group = mail
+mail_location = mbox:~/mail:INBOX=/var/mail/%u
+userdb {
+  driver = passwd
+}
+passdb {
+  args = %s
+  driver = pam
+}
+protocols = " imap"
+protocol imap {
+  mail_plugins = " autocreate"
+}
+plugin {
+  autocreate = Trash
+  autocreate2 = Sent
+  autosubscribe = Trash
+  autosubscribe2 = Sent
+}
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    group = postfix
+    mode = 0660
+    user = postfix
+  }
+}
+ssl=required
+ssl_cert = </etc/ssl/certs/mailcert.pem
+ssl_key = </etc/ssl/private/mail.key
+' >> /etc/dovecot/dovecot.conf
+
+# aliases configuration
+echo "writing aliases"
+cat <<< "
+root: $user
+mailer-daemon: $user
+postmaster: $user
+nobody: $user
+hostmaster: $user
+usenet: $user
+news: $user
+webmaster: $user
+www: $user
+ftp: $user
+abuse: $user
+" >> /etc/aliases
+newaliases >> /root/log.txt 2>&1
+
+# MAIL DONE
+echo "Mail Done - restarting services"
+postfix start >> /root/log.txt 2>&1
+service dovecot restart >> /root/log.txt 2>&1
+
+# mail test 
+echo "Test mail services and send test message to you"
+apt install mailutils -y --force-yes >> /root/log.txt 2>&1
+echo "Your server have a mail!" | mail -s "mail installation test" $usermail &&  echo "mail was sent, check your inbox" || echo "mail send failed" 
+
+#nginx
+echo "Installing nginx and php 7"
+apt install -y --force-yes nginx-extras php7.0 php7.0-curl php7.0-apcu php7.0-apcu php7.0-apcu php7.0-cli php7.0-bz2  php7.0-fpm php7.0-gd php7.0-geoip php7.0-gmp php7.0-gmp php7.0-igbinary php7.0-imagick php7.0-imap php7.0-intl php7.0-interbase php7.0-json php7.0-mbstring php7.0-mcrypt php7.0-memcached php7.0-mysql php7.0-odbc php7.0-pgsql php7.0-opcache php7.0-readline php7.0-recode php7.0-redis php7.0-sqlite3 php7.0-tidy php7.0-xml php7.0-xmlrpc php7.0-xsl php7.0-zip >> /root/log.txt 2>&1
+mkdir /sites/ -p >> /root/log.txt 2>&1
+
+# user passwd
+echo "Adding users"
+echo -e "$userpasswd\n$userpasswd\n$userfullname\n\n\n\n\n\n" | adduser $user --home /sites/$user --shell /bin/bash --ingroup www-data -q >> /root/log.txt 2>&1
+
+# simple nginx config for main domain
+echo "Writing $domain nginx config"
+cat <<< "
+server {
+	server_name $domain www.$domain;
+	root /sites/$user/$domain/;
+	index index.php;
+	allow all;
+	autoindex on;
+	location /.well-known/acme-challenge {
+		allow all;
+		autoindex on;
+	}
+}" > /etc/nginx/sites-available/$domain
+ln -s /etc/nginx/sites-available/$domain /etc/nginx/sites-enabled/$domain
+mkdir /sites/$user/$domain
+chown $user:www-data /sites/$user/$domain
+chmod 770 /sites/$user/$domain
+#nginx -t; read -n 1;
+service nginx restart
+
+# acme.sh install
+echo 'Installing acme.sh (let`s encrypt)'
+apt-get install cron netcat -y --force-yes >> /root/log.txt 2>&1
+curl -s https://get.acme.sh | sh >> /root/log.txt 2>&1
+mkdir /etc/nginx/ssl
+source /root/.bashrc
+
+# acme.sh verify domain
+echo "Domain verification"
+/root/.acme.sh/acme.sh --issue -d $domain -d www.$domain -w /sites/$user/$domain/ --home "/root/.acme.sh" >> /root/log.txt 2>&1
+
+#nginx permanent config for domain
+echo "Writing full nginx configuration"
+cat <<< '
+server {
+	server_name example.com www.example.com;
+	listen 80;
+	rewrite ^ https://$http_host$request_uri? permanent;
+}
+server {
+	server_name example.com www.example.com;
+#	listen 80;
+        	listen 443 ssl;
+    	ssl_certificate /etc/nginx/ssl/example.com.crt;
+    	ssl_certificate_key /etc/nginx/ssl/example.com.key;
+    	ssl_trusted_certificate /etc/nginx/ssl/example.com.ca;
+    root /sites/username/example.com;
+    index index.php;
+    allow all;
+    charset utf-8;
+    error_log   /var/log/nginx/example.com_error.log;
+    fastcgi_buffers 8 16k;
+    fastcgi_buffer_size 32k;
+    gzip on;
+    gzip_disable "msie6";
+    gzip_comp_level 6;
+    gzip_min_length 1100;
+    gzip_buffers 16 8k;
+    gzip_proxied any;
+    gzip_types text/plain application/xml
+    application/javascript
+    text/css
+    text/js
+    text/xml
+    application/x-javascript
+    text/javascript
+    application/json
+    application/xml+rss;
+    client_max_body_size 512m;
+    client_body_buffer_size 128k;
+    client_header_timeout   3m;
+    client_body_timeout 3m;
+    send_timeout 3m;
+    client_header_buffer_size   1k;
+    large_client_header_buffers 4 16k;
+    
+    location / {
+    	root /sites/username/example.com;
+    	index  index.php index.html;
+    	rewrite ^/api/(.*)$ /api.php?_d=$1&ajax_custom=1&$args last;
+    	try_files $uri $uri/ @fallback;
+    }
+    
+    location @fallback {
+    	rewrite  ^(.*)$ /index.php?$args last;
+    }
+    
+    location ~* \.(jpeg|ico|jpg|gif|png|css|js|pdf|txt|tar|gz|wof|csv|zip|xml|yml) {
+    	access_log off;
+    	try_files $uri @statics;
+    	expires 14d;
+    	add_header Access-Control-Allow-Origin *;
+    	add_header Cache-Control public;
+    	root /sites/username/example.com;
+    }
+    
+    location @statics {
+    	rewrite ^/(\w+)/(.*)$ /$2 break;
+    	access_log off;
+    	rewrite_log off;
+    	expires 14d;
+    	add_header Cache-Control public;
+    	add_header Access-Control-Allow-Origin *;
+    	root /sites/username/example.com;
+    }
+    
+    location ~ \.php$ {
+    	root /sites/username/example.com;
+    	proxy_read_timeout 61;
+    	fastcgi_read_timeout 61;
+    	try_files $uri $uri/ =404;
+    	fastcgi_pass unix:/var/run/php/php7.0-fpm.sock;
+    	fastcgi_index index.php;
+    	fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    	include fastcgi_params;
+    }
+    
+    location /.well-known/acme-challenge {
+    	allow all;
+    	autoindex on;
+    }
+    
+    location ~ /\.ht {
+    	deny  all;
+    }
+
+
+}
+
+' > /etc/nginx/sites-available/$domain
+
+sed -i "s/example.com/$domain/g" /etc/nginx/sites-available/$domain 
+sed -i "s/username/$user/g" /etc/nginx/sites-available/$domain 
+
+#install certificate 
+echo "Installing certificate"
+/root/.acme.sh/acme.sh --install-cert --home "/root/.acme.sh" -d $domain \
+--cert-file      /etc/nginx/ssl/$domain.crt  \
+--key-file       /etc/nginx/ssl/$domain.key  \
+--fullchain-file /etc/nginx/ssl/$domain.ca \
+--reloadcmd     "service nginx reload" >> /root/log.txt 2>&1
+
+#mysql installation
+echo 'Installing mysql'
+debconf-set-selections <<< "mysql-server-5.5	mysql-server/root_password string $mysqlpasswd"
+debconf-set-selections <<< "mysql-server-5.5	mysql-server/root_password_again string $mysqlpasswd"
+apt-get install mysql-server -y --force-yes >> /root/log.txt 2>&1 
+
+#proftpd installation
+echo 'Installing proftpd'
+debconf-set-selections <<< "proftpd-basic shared/proftpd/inetd_or_standalone select string standalone "
+apt-get install proftpd -y --force-yes >> /root/log.txt 2>&1
+
+echo 'Configuring proftpd'
+cp /etc/proftpd/proftpd.conf /etc/proftpd/proftpd.conf.orig
+sed -i 's/UseIPv6/#UseIPv6/g' /etc/proftpd/proftpd.conf
+cat <<< "
+UseIPv6 off
+DefaultRoot  ~
+
+Include /etc/proftpd/tls.conf
+
+<Limit LOGIN>
+    DenyGroup !www-data
+</Limit>
+" >> /etc/proftpd/proftpd.conf
+
+#proftpd tls config
+cp /etc/proftpd/tls.conf /etc/proftpd/tls.conf.orig
+cat <<< "
+<IfModule mod_tls.c>
+TLSEngine                  on
+TLSLog                     /var/log/proftpd/tls.log
+TLSProtocol                SSLv23
+TLSOptions                 NoCertRequest
+TLSRSACertificateFile      /etc/nginx/ssl/$domain.crt
+TLSRSACertificateKeyFile   /etc/nginx/ssl/$domain.key
+TLSVerifyClient            off
+TLSRequired                on
+</IfModule>
+" > /etc/proftpd/tls.conf
+service proftpd restart >> /root/log.txt 2>&1
+
+# clean up after yourself
+# Clearing your system
+echo "Clearing your system and apt"
+apt-get autoremove -y --force-yes >> /root/log.txt 2>&1
+apt-get autoclean -y --force-yes >> /root/log.txt 2>&1
+apt-get clean >> /root/log.txt 2>&1
+
+# Update apt cache
+echo "Updating package cache"
+echo ''>> /root/log.txt; echo 'apt-get update'>> /root/log.txt
+apt-get update  >> /root/log.txt 2>&1 || echo "update failed, check networking and apt config";
+# clean complete
+
+#time calc
+endTime=`date +%d-%m-%Y:%H:%M:%S`
+echo '' >> /root/log.txt;
+echo "installation finished at $endTime" >> /root/log.txt
+time=$((startTime-`date +%s`))
+time=$((time/60))
+
+#place test page
+echo "<?php echo phpinfo();" > /sites/$user/$domain/index.php
+chown -R $user:www-data /sites/$user
+
+#crontab 
+sed -i 's/#/* *     * * *   root    chmod -R 775 \/sites/g' /etc/crontab; echo \# >> /etc/crontab
+
+#have control - show status on login
+cat <<< 'echo "Postfix" && /etc/init.d/postfix status | grep Active && echo "Dovecot" && /etc/init.d/dovecot status | grep Active' >> /root/.profile
+cat <<< 'echo "Nginx" && /etc/init.d/nginx status | grep Active && echo "MySQL" && /etc/init.d/mysql status | grep Active' >> /root/.profile
+
+#message
+echo "
+Script work finished. Thank for using.
+Time elapsed (minutes): $time
+
+if you have errors - send file /root/log.php to me.
+
+your domain: $domain
+your php version: `php -v | head -n 1 | awk  '{print $2}'`
+Installed: mail, LEMP, ssl, ftp
+For any information, things or something else: eduard@generalov.net
+"
